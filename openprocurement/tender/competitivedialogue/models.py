@@ -295,6 +295,7 @@ class Tender(TenderEU):
                  'unsuccessful', STAGE2_STATUS],
         default='active.tendering')
 
+    create_accreditation = 'c'
 
     class Options:
         roles = stage_2_roles.copy()
