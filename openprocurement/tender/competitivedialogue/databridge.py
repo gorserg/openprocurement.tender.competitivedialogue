@@ -14,6 +14,7 @@ import logging.config
 import os
 import argparse
 import copy
+from functools import partial
 from restkit.errors import ResourceError
 
 from retrying import retry
@@ -22,7 +23,7 @@ from uuid import uuid4
 import gevent
 from gevent.queue import Queue
 
-from openprocurement_client.client import TendersClient, TendersClientSync
+from openprocurement_client.client import TendersClientSync as BaseTendersClientSync
 from yaml import load
 
 from openprocurement.tender.competitivedialogue.models_constants import (
@@ -63,8 +64,11 @@ def journal_context(record=None, params=None):
 
 def get_item_by_related_lot(items, lot_id):
     for item in items:
-        if item['relatedLot'] == lot_id:
-            yield item
+        try:
+            if item['relatedLot'] == lot_id:
+                yield item
+        except KeyError:
+            raise KeyError('Item should contain \'relatedLot\' field.')
 
 
 def get_lot_by_id(tender, lot_id):
@@ -87,10 +91,45 @@ def prepare_lot(orig_tender, lot_id, items):
     :param items: list with related item for lot
     :return: lot with new id
     """
+    lot = get_lot_by_id(orig_tender, lot_id)
+    if lot['status'] != 'active':
+        return False
     for item in get_item_by_related_lot(orig_tender['items'], lot_id):
         items.append(item)
-    lot = get_lot_by_id(orig_tender, lot_id)
     return lot
+
+
+def check_status_response(func):
+    def func_wrapper(obj, *args, **kwargs):
+        try:
+            response = func(obj, *args, **kwargs)
+        except ResourceError as re:
+            if re.status_int == 412:
+                obj.headers['Cookie'] = re.response.headers['Set-Cookie']
+                response = func(obj, *args, **kwargs)
+            else:
+                raise ResourceError(re)
+        return response
+    return func_wrapper
+
+
+class TendersClientSync(BaseTendersClientSync):
+
+    @check_status_response
+    def get_tender(self, *args, **kwargs):
+        return super(TendersClientSync, self).get_tender(*args, **kwargs)
+
+    @check_status_response
+    def extract_credentials(self, *args, **kwargs):
+        return super(TendersClientSync, self).extract_credentials(*args, **kwargs)
+
+    @check_status_response
+    def create_tender(self, *args, **kwargs):
+        return super(TendersClientSync, self).create_tender(*args, **kwargs)
+
+    @check_status_response
+    def patch_tender(self, *args, **kwargs):
+        return super(TendersClientSync, self).patch_tender(*args, **kwargs)
 
 
 class CompetitiveDialogueDataBridge(object):
@@ -108,17 +147,18 @@ class CompetitiveDialogueDataBridge(object):
 
         self.tenders_sync_client = TendersClientSync(
             '',
-            host_url=self.config_get('tenders_api_server'),
+            host_url=self.config_get('public_tenders_api_server') or self.config_get('tenders_api_server'),
             api_version=self.config_get('tenders_api_version'),
         )
 
-        self.client = TendersClient(
+        self.client = TendersClientSync(
             self.config_get('api_token'),
             host_url=self.config_get('tenders_api_server'),
             api_version=self.config_get('tenders_api_version'),
         )
 
         self.initial_sync_point = {}
+        self.initialization_event = gevent.event.Event()
         self.competitive_dialogues_queue = Queue(maxsize=500)  # Id tender which need to check
         self.handicap_competitive_dialogues_queue = Queue(maxsize=500)
         self.dialogs_stage2_put_queue = Queue(maxsize=500)  # queue with new tender data
@@ -132,6 +172,7 @@ class CompetitiveDialogueDataBridge(object):
 
         self.dialog_set_complete_queue = Queue(maxsize=500)
         self.dialog_retry_set_complete_queue = Queue(maxsize=500)
+        self.jobs_watcher_delay = self.config_get('jobs_watcher_delay') or 15
 
     def config_get(self, name):
         return self.config.get('main').get(name)
@@ -155,17 +196,19 @@ class CompetitiveDialogueDataBridge(object):
         # initial sync point
         if direction == "backward":
             assert params['descending']
-            response = self.tenders_sync_client.sync_tenders(params,
-                                                             extra_headers={'X-Client-Request-ID': generate_req_id()})
+            response = self.tenders_sync_client.sync_tenders(params, extra_headers={'X-Client-Request-ID': generate_req_id()})
             # set values in reverse order due to 'descending' option
             self.initial_sync_point = {'forward_offset': response.prev_page.offset,
                                        'backward_offset': response.next_page.offset}
+            self.initialization_event.set()
             logger.info("Initial sync point {}".format(self.initial_sync_point))
             return response
         elif not self.initial_sync_point:
             raise ValueError
         else:
             assert 'descending' not in params
+            gevent.wait([self.initialization_event])
+            self.initialization_event.clear()
             params['offset'] = self.initial_sync_point['forward_offset']
             logger.info("Starting forward sync from offset {}".format(params['offset']))
             return self.tenders_sync_client.sync_tenders(params,
@@ -208,7 +251,7 @@ class CompetitiveDialogueDataBridge(object):
     def get_competitive_dialogue_data(self):
         while True:
             try:
-                tender_to_sync = self.competitive_dialogues_queue.get()  # Get competitive dialogue which we want to sync
+                tender_to_sync = self.competitive_dialogues_queue.peek()  # Get competitive dialogue which we want to sync
                 tender = self.tenders_sync_client.get_tender(tender_to_sync['id'])['data']  # Try get data by tender id
             except Exception, e:
                 # If we have something problems then put tender back to queue
@@ -258,6 +301,8 @@ class CompetitiveDialogueDataBridge(object):
                         if qualification.get('lotID'):
                             if qualification['lotID'] not in old_lots:  # check if lot id in local dict with new lots
                                 lot = prepare_lot(tender, qualification['lotID'], items)  # update lot with new id
+                                if not lot:  # Go next iter if not lot
+                                    continue
                                 old_lots[qualification['lotID']] = lot  # set new lot in local dict
                             bid = get_bid_by_id(tender['bids'], qualification['bidID'])
                             for bid_tender in bid['tenderers']:
@@ -291,6 +336,7 @@ class CompetitiveDialogueDataBridge(object):
                             if feature['relatedItem'] in old_lots.keys():
                                 new_tender['features'].append(feature)
                 new_tender['shortlistedFirms'] = short_listed_firms.values()
+                self.competitive_dialogues_queue.get()
                 self.handicap_competitive_dialogues_queue.put(new_tender)
 
     def prepare_new_tender_data(self):
@@ -418,9 +464,14 @@ class CompetitiveDialogueDataBridge(object):
                 self._patch_dialog_add_stage2_id_with_retry(dialog)
             except:
                 logger.warn("Can't patch competitive dialogue id={0}".format(dialog['id']),
-                            extra=journal_context({"MESSAGE_ID": DATABRIDGE_CD_UNSUCCESSFUL_PATCH_STAGE2_ID,
-                                                   "TENDER_ID": dialog['id']}))
+                            extra=journal_context({"MESSAGE_ID": DATABRIDGE_CD_UNSUCCESSFUL_PATCH_STAGE2_ID},
+                                                  {"TENDER_ID": dialog['id']}))
                 self.competitive_dialogues_queue.put({"id": dialog['id']})
+            else:
+                data = {"id": dialog['stage2TenderID'],
+                        "status": STAGE2_STATUS,
+                        "dialogueID": dialog['id']}
+                self.dialogs_stage2_patch_queue.put(data)
             gevent.sleep(0)
 
     def patch_new_tender_status(self):
@@ -512,7 +563,7 @@ class CompetitiveDialogueDataBridge(object):
             except:
                 logger.warn("Can't patch tender stage2 id={0} with status {1}".format(patch_data['id'], patch_data['status']),
                             extra=journal_context({"MESSAGE_ID": DATABRIDGE_UNSUCCESSFUL_PATCH_NEW_TENDER_STATUS,
-                                                   "TENDER_ID": path_data['id']}))
+                                                   "TENDER_ID": patch_data['id']}))
                 self.competitive_dialogues_queue.put({"id": patch_data['dialogueID']})
             gevent.sleep(0)
 
@@ -544,6 +595,10 @@ class CompetitiveDialogueDataBridge(object):
                             extra=journal_context({"MESSAGE_ID": DATABRIDGE_CREATE_ERROR,
                                                    "TENDER_ID": new_tender['dialogueID']}))
                 self.competitive_dialogues_queue.put({"id": new_tender['dialogueID']})
+            else:
+                dialog = {"id": new_tender['dialogueID'],
+                          "stage2TenderID": new_tender['id']}
+                self.dialog_stage2_id_queue.put(dialog)
             gevent.sleep(0)
 
     def get_competitive_dialogue_forward(self):
@@ -578,35 +633,62 @@ class CompetitiveDialogueDataBridge(object):
         else:
             logger.info('Backward data sync finished.')
 
-    def run(self):
-        logger.info('Start Competitive Dialogue Data Bridge')
-        self.immortal_jobs = [
-            gevent.spawn(self.get_competitive_dialogue_data),
-            gevent.spawn(self.prepare_new_tender_data),
-            gevent.spawn(self.put_tender_stage2),
-            gevent.spawn(self.retry_put_tender_stage2),
-            gevent.spawn(self.patch_dialog_add_stage2_id),
-            gevent.spawn(self.retry_patch_dialog_add_stage2_id),
-            gevent.spawn(self.patch_new_tender_status),
-            gevent.spawn(self.retry_patch_new_tender_status),
-            gevent.spawn(self.path_dialog_status),
-            gevent.spawn(self.retry_patch_dialog_status)
-        ]
-        while True:
-            try:
-                logger.info('Starting forward and backward sync workers')
-                self.jobs = [
-                    gevent.spawn(self.get_competitive_dialogue_backward),
-                    gevent.spawn(self.get_competitive_dialogue_forward),
-                ]
-                gevent.joinall(self.jobs)
-            except KeyboardInterrupt:
-                logger.info('Exiting...')
-                gevent.killall(self.jobs, timeout=5)
-                break
-            except Exception, e:
-                logger.exception(e)
+    def catch_exception(self, exc, name):
+        """Restarting job"""
+        if name == 'get_competitive_dialogue_data':
+            tender = self.competitive_dialogues_queue.get()  # delete invalid tender from queue
+            logger.info('Remove invalid tender {}'.format(tender.id))
+        self.immortal_jobs[name] = gevent.spawn(getattr(self, name))
+        self.immortal_jobs[name].link_exception(partial(self.catch_exception, name=name))
 
+    def _start_competitive_sculptors(self):
+        logger.info('Start Competitive Dialogue Data Bridge')
+        self.immortal_jobs = {
+            'get_competitive_dialogue_data': gevent.spawn(self.get_competitive_dialogue_data),
+            'prepare_new_tender_data': gevent.spawn(self.prepare_new_tender_data),
+            'put_tender_stage2': gevent.spawn(self.put_tender_stage2),
+            'retry_put_tender_stage2': gevent.spawn(self.retry_put_tender_stage2),
+            'patch_dialog_add_stage2_id': gevent.spawn(self.patch_dialog_add_stage2_id),
+            'retry_patch_dialog_add_stage2_id': gevent.spawn(self.retry_patch_dialog_add_stage2_id),
+            'patch_new_tender_status': gevent.spawn(self.patch_new_tender_status),
+            'retry_patch_new_tender_status': gevent.spawn(self.retry_patch_new_tender_status),
+            'path_dialog_status': gevent.spawn(self.path_dialog_status),
+            'retry_patch_dialog_status': gevent.spawn(self.retry_patch_dialog_status)
+        }
+        for name, job in self.immortal_jobs.items():
+            job.link_exception(partial(self.catch_exception, name=name))
+
+    def _start_competitive_wokers(self):
+        self.jobs = [
+            gevent.spawn(self.get_competitive_dialogue_backward),
+            gevent.spawn(self.get_competitive_dialogue_forward),
+        ]
+        gevent.joinall(self.jobs)
+
+    def _restart_synchronization_workers(self):
+        logger.warn("Restarting synchronization", extra=journal_context({"MESSAGE_ID": DATABRIDGE_RESTART}, {}))
+        for j in self.jobs:
+            j.kill()
+        self._start_competitive_wokers()
+
+    def run(self):
+        self._start_competitive_sculptors()
+        self._start_competitive_wokers()
+        backward_worker, forward_worker = self.jobs
+
+        try:
+            while True:
+                gevent.sleep(self.jobs_watcher_delay)
+                if forward_worker.dead or (backward_worker.dead and not backward_worker.successful()):
+                    self._restart_synchronization_workers()
+                    backward_worker, forward_worker = self.jobs
+            logger.info('Starting forward and backward sync workers')
+        except KeyboardInterrupt:
+            logger.info('Exiting...')
+            gevent.killall(self.jobs, timeout=5)
+            gevent.killall(self.immortal_jobs, timeout=5)
+        except Exception, e:
+            logger.exception(e)
             logger.warn("Restarting synchronization", extra=journal_context({"MESSAGE_ID": DATABRIDGE_RESTART}))
 
 
