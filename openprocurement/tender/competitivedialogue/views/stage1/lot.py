@@ -20,3 +20,4 @@ class CompetitiveDialogueEULotResource(TenderLotResource):
             description="Competitive Dialogue UA lots")
 class CompetitiveDialogueUALotResource(TenderLotResource):
     pass
+
