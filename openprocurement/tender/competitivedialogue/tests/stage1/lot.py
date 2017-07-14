@@ -3146,29 +3146,9 @@ class CompetitiveDialogueUALotProcessTest(BaseCompetitiveDialogUAContentWebTest)
         self.time_shift('active.pre-qualification')
         self.check_chronograph()
 
-        response = self.app.get('/tenders/{}/qualifications?acc_token={}'.format(self.tender_id, owner_token))
-        self.assertEqual(response.content_type, 'application/json')
-        qualifications = response.json['data']
-
-        for qualification in qualifications:
-            response = self.app.patch_json('/tenders/{}/qualifications/{}?acc_token={}'.format(self.tender_id,
-                                                                                               qualification['id'],
-                                                                                               owner_token),
-                                      {"data": {'status': 'active', "qualified": True, "eligible": True}})
-            self.assertEqual(response.status, '200 OK')
-            self.assertEqual(response.json['data']['status'], 'active')
-        response = self.app.patch_json('/tenders/{}?acc_token={}'.format(tender_id, owner_token),
-                                       {"data": {"status": "active.pre-qualification.stand-still"}})
-        self.assertEqual(response.status, "200 OK")
-        self.check_chronograph()
-
         response = self.app.get('/tenders/{}?acc_token={}'.format(self.tender_id, owner_token))
-        self.assertEqual(response.content_type, 'application/json')
-        self.assertEqual(response.status, "200 OK")
-
-        response = self.app.get('/tenders/{}/qualifications?acc_token={}'.format(self.tender_id, owner_token))
-        self.assertEqual(response.content_type, 'application/json')
-        self.assertEqual(response.status, "200 OK")
+        self.assertTrue(all([i['status'] == 'unsuccessful' for i in response.json['data']['lots']]))
+        self.assertEqual(response.json['data']['status'], 'unsuccessful')
 
     def test_1lot_3bid_1un(self):
         self.app.authorization = ('Basic', ('broker', ''))
