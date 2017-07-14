@@ -14,6 +14,7 @@ from openprocurement.tender.competitivedialogue.tests.base import (BaseCompetiti
 
 from openprocurement.tender.competitivedialogue.models import FEATURES_MAX_SUM
 
+test_bids.append(test_bids[0].copy())  # Minimal number of bids is 3.
 
 class CompetitiveDialogueEULotResourceTest(BaseCompetitiveDialogEUContentWebTest):
 
